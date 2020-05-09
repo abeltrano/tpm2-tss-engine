@@ -119,6 +119,104 @@ static int EC_GROUP_order_bits(const EC_GROUP *group)
 }
 #endif
 
+ /**
+  * Initialize a TPM2B_ECC_POINT from an OpenSSL EC_POINT.
+  *
+  * @param point Pointer to output tpm point
+  * @param pub_key OpenSSL public key to convert
+  * @param group Curve group
+  * @retval 0 on failure
+  */
+static int
+init_tpm_public_point(TPM2B_ECC_POINT *point, const EC_POINT *ec_point,
+                        const EC_GROUP *ec_group)
+{
+    unsigned char buffer[1 + sizeof(point->point.x.buffer)
+                           + sizeof(point->point.y.buffer)];
+    BN_CTX *ctx = BN_CTX_new();
+    if (!ctx)
+        return 0;
+
+    BN_CTX_start(ctx);
+    size_t len = EC_POINT_point2oct(ec_group, ec_point,
+                    POINT_CONVERSION_UNCOMPRESSED, buffer, sizeof(buffer), ctx);
+    BN_CTX_free(ctx);
+    len = (len - 1) / 2;
+
+    point->point.x.size = len;
+    point->point.y.size = len;
+    memcpy(point->point.x.buffer, &buffer[1], len);
+    memcpy(point->point.y.buffer, &buffer[1 + len], len);
+
+    return 1;
+}
+
+/**
+ * Generate a shared secret using a TPM key
+ *
+ * @param psec Pointer to output buffer holding shared secret
+ * @param pseclen Size of the psec buffer
+ * @param pub_key The peer's public key
+ * @param ecdh The ECC key object for the host private key
+ * @retval 0 on failure
+ */
+static int
+ecdh_compute_key(unsigned char **psec, size_t *pseclen,
+                    const EC_POINT *pub_key, const EC_KEY *eckey)
+{
+    /*
+     * If this is not a TPM2 key, bail out since fall through to software
+     * functions requires a non-const EC_KEY, yet the ECDH prototype only
+     * provides it as const.
+     */
+    TPM2_DATA *tpm2Data = tpm2tss_ecc_getappdata(eckey);
+    if (tpm2Data == NULL)
+        return 0;
+
+    int ret;
+    TSS2_RC r;
+    ESYS_CONTEXT *esys_ctx = NULL;
+    ESYS_TR keyHandle = ESYS_TR_NONE;
+
+    r = init_tpm_key(&esys_ctx, &keyHandle, tpm2Data);
+    ERRchktss(ecdh_compute_key, r, goto error);
+
+    TPM2B_ECC_POINT inPoint;
+    TPM2B_ECC_POINT *outPoint = NULL;
+    const EC_GROUP *group = EC_KEY_get0_group(eckey);
+
+    ret = init_tpm_public_point(&inPoint, pub_key, group);
+    if (!ret)
+        goto error;
+
+    r = Esys_ECDH_ZGen(esys_ctx, keyHandle,
+            ESYS_TR_PASSWORD, ESYS_TR_NONE, ESYS_TR_NONE,
+            &inPoint, &outPoint);
+    ERRchktss(ecdh_compute_key, r, goto error);
+
+    *pseclen = outPoint->point.x.size;
+    *psec = OPENSSL_malloc(*pseclen);
+    if (!*psec)
+        goto error;
+
+    memcpy(*psec, outPoint->point.x.buffer, *pseclen);
+    ret = 1;
+    goto out;
+error:
+    ret = 0;
+out:
+    if (keyHandle != ESYS_TR_NONE) {
+        if (tpm2Data->privatetype == KEY_TYPE_HANDLE) {
+            Esys_TR_Close(esys_ctx, &keyHandle);
+        } else {
+            Esys_FlushContext(esys_ctx, keyHandle);
+        }
+    }
+    Esys_Free(outPoint);
+    esys_ctx_free(&esys_ctx);
+    return ret;
+}
+
 /** Sign data using a TPM key
  *
  * This function performs the sign function using the private key in ECDSA.
@@ -414,7 +512,7 @@ tpm2tss_ecc_makekey(TPM2_DATA *tpm2Data)
  * @retval NULL on failure.
  */
 TPM2_DATA *
-tpm2tss_ecc_getappdata(EC_KEY *key)
+tpm2tss_ecc_getappdata(const EC_KEY *key)
 {
     if (ec_key_app_data == -1) {
         DBG("Module uninitialized\n");
@@ -595,6 +693,7 @@ init_ecc(ENGINE *e)
         = NULL;
     EC_KEY_METHOD_get_sign(ecc_methods, &orig_sign, NULL, NULL);
     EC_KEY_METHOD_set_sign(ecc_methods, orig_sign, NULL, ecdsa_sign);
+    EC_KEY_METHOD_set_compute_key(ecc_methods, ecdh_compute_key);
 
     if (ec_key_app_data == -1)
         ec_key_app_data = EC_KEY_get_ex_new_index(0, NULL, NULL, NULL, NULL);

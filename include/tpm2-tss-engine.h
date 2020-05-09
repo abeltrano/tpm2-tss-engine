@@ -83,7 +83,7 @@ tpm2tss_ecc_genkey(EC_KEY *key, TPMI_ECC_CURVE curve, const char *password,
                    TPM2_HANDLE parentHandle);
 
 TPM2_DATA *
-tpm2tss_ecc_getappdata(EC_KEY *key);
+tpm2tss_ecc_getappdata(const EC_KEY *key);
 
 int
 tpm2tss_ecc_setappdata(EC_KEY *key, TPM2_DATA *data);
